@@ -8,6 +8,7 @@ import io
 import json
 import re
 from io import BytesIO
+from openpyxl.styles import Font
 
 # --- 1. НАСТРОЙКИ ---
 load_dotenv()
@@ -62,8 +63,12 @@ def save_history(history):
 
 if 'chat_history' not in st.session_state:
     if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            st.session_state['chat_history'] = json.load(f)
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                st.session_state['chat_history'] = json.loads(content) if content else []
+        except:
+            st.session_state['chat_history'] = []
     else:
         st.session_state['chat_history'] = []
 
@@ -101,11 +106,11 @@ with st.sidebar:
     if st.button("🗑️ Очистить"):
         st.session_state['chat_history'] = []
         if 'last_file' in st.session_state: del st.session_state['last_file']
+        save_history([])
         st.rerun()
 
 st.title("📊 Excel AI Agent")
 
-# Кнопка скачивания появляется сверху, если файл готов
 if 'last_file' in st.session_state:
     st.download_button(
         label="📥 СКАЧАТЬ EXCEL ФАЙЛ",
@@ -129,7 +134,6 @@ if query:
     with st.spinner("Агент готовит ответ..."):
         active_model = MODELS_CONFIG[st.session_state['selected_model']]
         
-        # Подготовка контента
         if uploaded_file:
             if uploaded_file.name.lower().endswith(('.png', '.jpg')):
                 contents = [query, Image.open(uploaded_file)]
@@ -140,40 +144,48 @@ if query:
             contents = [query]
 
         try:
-            # Запрос (Gemma vs Gemini)
             if "gemini" in active_model:
                 res = client.models.generate_content(model=active_model, contents=contents, config={"system_instruction": SYSTEM_INSTRUCTION})
             else:
-                if isinstance(contents[0], str): contents[0] = f"{SYSTEM_INSTRUCTION}\n\n{contents[0]}"
-                res = client.models.generate_content(model=active_model, contents=contents)
+                formatted_prompt = f"{SYSTEM_INSTRUCTION}\n\n{contents[0]}" if isinstance(contents[0], str) else contents[0]
+                res = client.models.generate_content(model=active_model, contents=[formatted_prompt] + contents[1:])
             
             resp_text = res.text
 
-            # ПАРСИНГ ТАБЛИЦЫ (Специально под твой пример)
-            if "Дата" in resp_text or "\\t" in resp_text or "\t" in resp_text or "|" in resp_text:
+            # --- ПАРСИНГ ТАБЛИЦЫ И BOLD ---
+            if "СДЕЛАЙ В ЭКСЕЛЬ" in resp_text or "\\t" in resp_text or "\t" in resp_text:
                 try:
                     clean_text = resp_text.replace("СДЕЛАЙ В ЭКСЕЛЬ", "").strip()
                     
-                    # Если ИИ прислал всё одной строкой с текстовыми \t
+                    # Разбор "слипшихся" строк или стандартных строк
                     if "\\t" in clean_text and "\n" not in clean_text:
-                        cells = clean_text.split("\\t")
-                        # Разбиваем на строки по 4 колонки (как в твоем примере)
+                        cells = re.split(r'\\t|\t', clean_text)
+                        cells = [c.strip() for c in cells if c.strip()]
                         rows = [cells[i:i+4] for i in range(0, len(cells), 4)]
                     else:
-                        # Стандартный разбор
-                        lines = [l for l in clean_text.split('\n') if '\t' in l or '|' in l or '  ' in l]
-                        rows = []
-                        for l in lines:
-                            r = l.split('\t') if '\t' in l else [c.strip() for c in l.split('|') if c.strip()]
-                            if len(r) > 1: rows.append(r)
-                    
+                        lines = [l for l in clean_text.split('\n') if '\t' in l or '|' in l]
+                        rows = [re.split(r'\t|\|', l) for l in lines]
+                        rows = [[c.strip() for c in r if c.strip()] for r in rows]
+
                     if rows:
                         df_out = pd.DataFrame(rows)
                         out_io = BytesIO()
                         with pd.ExcelWriter(out_io, engine='openpyxl') as writer:
-                            df_out.to_excel(writer, index=False, header=False)
+                            df_out.to_excel(writer, index=False, header=False, sheet_name='Sheet1')
+                            
+                            # Применяем жирный шрифт по знаку !
+                            ws = writer.sheets['Sheet1']
+                            bold_f = Font(bold=True)
+                            for row in ws.iter_rows():
+                                for cell in row:
+                                    val = str(cell.value) if cell.value else ""
+                                    if val.startswith('!') and not val.startswith('!Срочно'):
+                                        cell.value = val[1:] # Удаляем !
+                                        cell.font = bold_f
+                        
                         st.session_state['last_file'] = out_io.getvalue()
-                except: pass
+                except Exception as e:
+                    print(f"Ошибка парсинга: {e}")
 
         except Exception as e:
             resp_text = f"Ошибка: {e}"
